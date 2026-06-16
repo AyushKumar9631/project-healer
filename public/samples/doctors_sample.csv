@@ -1,0 +1,4 @@
+name,specialization,super_specialization,qualifications,experience_years,conditions,languages,availability,consultation_fee,patients_treated,online_consultation
+Dr. Asha Verma,Cardiology,Interventional Cardiology,"MBBS, MD, DM",15,hypertension|chest pain|arrhythmia,Hindi|English,"Mon-Fri, 10 AM - 4 PM",800,5200,yes
+Dr. Rohit Sharma,Orthopedics,Joint Replacement,"MBBS, MS Ortho",10,knee pain|fracture|arthritis,Hindi|English|Punjabi,"Mon-Sat, 11 AM - 5 PM",600,3800,no
+Dr. Neha Iyer,Dermatology,,"MBBS, MD",8,acne|eczema|hair loss,Hindi|English|Tamil,"Tue-Sun, 12 PM - 6 PM",500,2400,yes
