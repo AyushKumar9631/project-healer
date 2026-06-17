@@ -71,14 +71,22 @@ ${formattedTranscript}`;
         body: JSON.stringify({
           contents: [{ role: "user", parts: [{ text: analysisPrompt }] }],
           generationConfig: {
-            maxOutputTokens: 150,
             temperature: 0.1,
           },
         }),
       });
 
       if (!res.ok) {
+        const errorText = await res.text().catch(() => "Unable to read error text");
         console.error(`[Feedback Task] Gemini API returned non-200 for call ${call.id}: ${res.status}`);
+        console.error(`[Feedback Task] Google API Error Details: ${errorText}`);
+
+        // If we hit a 429 Rate Limit, aggressively back off and break the loop 
+        // to let the token bucket refill before the next worker tick.
+        if (res.status === 429) {
+          console.warn(`[Feedback Task] Rate limit hit (429). Backing off until next tick...`);
+          break; 
+        }
         continue;
       }
 
@@ -99,6 +107,11 @@ ${formattedTranscript}`;
           console.log(`[Feedback Task] Successfully logged memory analysis summary for call ${call.id}`);
         }
       }
+
+      // Artificial delay to prevent hitting Google's free-tier 15 RPM limit
+      // Waits 4 seconds between each successful call (max 15 calls per minute)
+      await new Promise((resolve) => setTimeout(resolve, 4000));
+
     } catch (err) {
       console.error(`[Feedback Task Exception] Error parsing call summary transaction ${call.id}:`, err);
     }

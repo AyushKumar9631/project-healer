@@ -94,8 +94,19 @@ wss.on("connection", (plivoWs, req) => {
   console.log("[plivo] connected", req.headers["x-call-id"] ?? "(no callId yet)");
 
   let streamId: string | null = null;
-  // Prefer callId from x-call-id extra header (set in voice XML).
-  let callId: string | null = (req.headers["x-call-id"] as string | undefined) ?? null;
+  // callId can arrive via the x-call-id extra header (set in voice XML) OR
+  // via the WS upgrade URL query string (?callId=...), which is always
+  // present even if the caller hangs up before Plivo sends the "start"
+  // event — the header/start payload race the caller's early hangup.
+  const urlCallId: string | null = (() => {
+    try {
+      const u = new URL(req.url ?? "/", "http://localhost");
+      return u.searchParams.get("callId") || null;
+    } catch {
+      return null;
+    }
+  })();
+  let callId: string | null = (req.headers["x-call-id"] as string | undefined) ?? urlCallId ?? null;
   // Direction from URL query string set by /api/public/plivo/voice for
   // inbound calls. Final answer also OR'd with start.event extra_headers.
   let isInbound = (() => {
@@ -293,7 +304,8 @@ wss.on("connection", (plivoWs, req) => {
   function cleanup() {
     if (closed) return;
     closed = true;
-    if (callId) {
+    const finalCallId = callId ?? urlCallId;
+    if (finalCallId) {
       const dur = tStreamStart ? Math.max(0, Math.round((Date.now() - tStreamStart) / 1000)) : 0;
       timing.record("bridge_end_request", {
         end_reason: endReason,
@@ -303,7 +315,7 @@ wss.on("connection", (plivoWs, req) => {
       });
       timing.record("call_terminal", { end_reason: endReason });
       timing.flush().catch((e) => console.error("[timing/flush] cleanup error:", e instanceof Error ? e.message : e));
-      notifyBridgeEnd(callId, endReason, answered, hadPatientTurn, dur).catch((e) =>
+      notifyBridgeEnd(finalCallId, endReason, answered, hadPatientTurn, dur).catch((e) =>
         console.error("[bridge/end] notify failed:", e instanceof Error ? e.message : e),
       );
     }

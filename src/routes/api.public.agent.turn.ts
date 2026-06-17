@@ -577,7 +577,7 @@ export function evictCallContext(callId: string) {
 //   4. call_events log entry
 // Completely fire-and-forget from the caller's perspective (caller uses void).
 // ---------------------------------------------------------------------------
-async function runInboundPostCallExtraction(args: {
+export async function runInboundPostCallExtraction(args: {
   supabase: ReturnType<typeof buildAdminClient>;
   callId: string;
   clinicId: string;

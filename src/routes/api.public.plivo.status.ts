@@ -22,6 +22,66 @@ import { mirrorOutcomeFromCall } from "@/lib/playbooks/_mirror";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
 import { fetchAndStorePlivoRecording } from "@/lib/plivo-recording.server";
 import type { TablesUpdate } from "@/integrations/supabase/types";
+import { runCallPostprocess } from "@/lib/call-postprocess.server";
+import { runInboundPostCallExtraction } from "./api.public.agent.turn";
+import type { TranscriptTurn } from "@/lib/extractSymptoms";
+
+// Runs the SAME extraction the agent-driven end_call=true path runs inside
+// api.public.agent.turn.ts (condition_mentioned, topic, suggested_doctor_id,
+// appointment_time, WhatsApp notifications), for inbound calls that ended
+// WITHOUT the agent ever setting end_call=true — i.e. the caller hung up.
+// THIS is the actual fix for "condition_mentioned not populated on caller
+// hangup": that extraction logic only ever fired from inside agent/turn,
+// which never runs again once the caller has hung up — no amount of status
+// or duration bookkeeping in this route touches it. No-ops for outbound
+// calls and no-ops if extraction already ran (idempotency via
+// outcome.post_call_extracted, the same flag the agent-driven path sets).
+async function runCallerHangupExtractionIfNeeded(callId: string): Promise<void> {
+  try {
+    const { data: call, error } = await supabaseAdmin
+      .from("calls")
+      .select("clinic_id,patient_id,direction,transcript,intent,outcome")
+      .eq("id", callId)
+      .maybeSingle();
+    if (error || !call) return;
+    if (call.direction !== "inbound") return;
+
+    const outcome =
+      typeof call.outcome === "object" && call.outcome !== null && !Array.isArray(call.outcome)
+        ? (call.outcome as Record<string, unknown>)
+        : {};
+    if (outcome.post_call_extracted === true) {
+      console.log(`[plivo/status] extraction already ran (agent-driven) callId=${callId}, skipping`);
+      return;
+    }
+
+    const transcript = Array.isArray(call.transcript)
+      ? (call.transcript as unknown as TranscriptTurn[])
+      : [];
+    if (transcript.length === 0) {
+      console.log(`[plivo/status] no transcript to extract from callId=${callId}, skipping`);
+      return;
+    }
+
+    console.log(`[plivo/status] caller-hangup detected, running post-call extraction callId=${callId}`);
+    await runInboundPostCallExtraction({
+      supabase: supabaseAdmin,
+      callId,
+      clinicId: call.clinic_id,
+      patientId: call.patient_id,
+      transcript: transcript.map((t) => ({
+        role: t.role === "patient" ? ("caller" as const) : ("agent" as const),
+        text: t.text,
+      })),
+      callerIntent: call.intent ?? null,
+      clinicKB: null,
+    });
+  } catch (e) {
+    console.error(
+      `[plivo/status] caller-hangup extraction failed (non-fatal) callId=${callId}: ${e instanceof Error ? e.message : e}`,
+    );
+  }
+}
 
 const TERMINAL_STATES = new Set([
   "completed", "busy", "no_answer", "failed", "voicemail", "declined",
@@ -214,6 +274,10 @@ export const Route = createFileRoute("/api/public/plivo/status")({
                 console.error("[plivo/status] recording fetch failed:", e instanceof Error ? e.message : e);
               }
             }
+            // runCallPostprocess is idempotent — safe even if bridge/end
+            // already ran it for this call.
+            await runCallPostprocess(supabaseAdmin, callId, existing.clinic_id);
+            await runCallerHangupExtractionIfNeeded(callId);
             return new Response("ok", { status: 200 });
           }
 
@@ -251,6 +315,14 @@ export const Route = createFileRoute("/api/public/plivo/status")({
                 console.error("[plivo/status] recording fetch failed:", e instanceof Error ? e.message : e);
               }
             }
+            // ---- TRIGGER SHARED POST-PROCESSING ----
+            // This is the caller-hangup path: Plivo's hangup_url reaches us
+            // here BEFORE the bridge's WS "close" reaches /api/public/bridge/end
+            // (or the bridge has no callId at all for an early hangup).
+            await runCallPostprocess(supabaseAdmin, callId, existing.clinic_id);
+            // THE ACTUAL FIX: agent-driven extraction never ran since the
+            // caller hung up before the agent set end_call=true.
+            await runCallerHangupExtractionIfNeeded(callId);
           }
         } catch (e) {
           console.error("[plivo/status] handler failed:", e instanceof Error ? e.message : e);

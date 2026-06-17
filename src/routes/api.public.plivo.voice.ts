@@ -231,12 +231,19 @@ async function handle(request: Request) {
     redirect="false" />`
     : "";
 
+  // Same pattern as outbound (api.calls.start-plivo.ts → plivo-call.server.ts):
+  // hangup_url posts to /api/public/plivo/status so the DB always gets the
+  // terminal status update even if the caller hangs up before the bridge's
+  // WS "start" event fires (early-hangup race where bridge cleanup() has no
+  // callId yet).
+  const hangupUrl = `${publicBase(request)}/api/public/plivo/status?callId=${encodeURIComponent(callId)}`;
+
   console.log(
     `[plivo/voice] stream callId=${callId} noiseCancellation=${ncEnabled} level=${ncEnabled ? ncLevel : "n/a"} recording=${recordingEnabled} maxLength=${recordingEnabled ? recordingMaxLength : "n/a"}`,
   );
 
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>${recordElement}
+<Response hangupUrl="${xmlEscape(hangupUrl)}" hangupMethod="POST">${recordElement}
   <Stream
     bidirectional="true"
     contentType="audio/x-mulaw;rate=8000"
