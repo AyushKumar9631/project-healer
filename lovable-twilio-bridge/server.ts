@@ -98,7 +98,7 @@ const ELEVENLABS_STT_LANGUAGE = process.env.ELEVENLABS_STT_LANGUAGE ?? "hin";
 // commits. Tune via env on canary numbers first; never hard-code below 0.4.
 const SCRIBE_VAD_SILENCE_SECS = (() => {
   const raw = process.env.STT_SILENCE_SECS;
-  if (!raw) return 0.4;
+  if (!raw) return 0.3;
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0.2 || n > 3) return 0.4;
   return n;
@@ -943,6 +943,29 @@ type AgentTurnResult = {
   symptoms_mentioned?: string[];
   red_flag?: boolean;
   resolved?: boolean;
+  // Already-loaded clinic KB (rendered text) from turn-stream's context load.
+  // Forwarded as-is to /agent/turn via injectedReply so it can reuse it
+  // instead of re-running loadClinicKnowledge for this same turn.
+  clinic_kb_rendered?: string | null;
+  // Already-loaded patient/clinic rows + identifiers from turn-stream's
+  // context load. Forwarded as-is to /agent/turn via injectedReply so
+  // getCallContext can seed itself instead of re-querying calls/patients/
+  // clinics for this same turn.
+  patient_snapshot?: {
+    id: string;
+    name: string;
+    bp: string | null;
+    blood_sugar: string | null;
+    health_camp: string | null;
+    age: number | null;
+    gender: string | null;
+    risk: string | null;
+    phone: string;
+  } | null;
+  clinic_snapshot?: { id: string; name: string } | null;
+  clinic_id?: string | null;
+  patient_id?: string | null;
+  campaign_id?: string | null;
 };
 
 async function* fetchAgentReplyStreaming(

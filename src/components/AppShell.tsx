@@ -29,7 +29,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           </div>
           <div>
             <div className="font-semibold text-sm">CarePulse</div>
-            <div className="text-xs text-muted-foreground">Voice AI(v5)</div>
+            <div className="text-xs text-muted-foreground">Voice AI(v6)</div>
           </div>
         </div>
         <nav className="flex-1 p-3 space-y-1">

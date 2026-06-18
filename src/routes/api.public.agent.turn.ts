@@ -21,8 +21,6 @@ import { extractInboundCallData } from "@/lib/inbound-post-call-extractor";
 // Consent + callback-time helpers live in src/lib/agent-consent.ts so the
 // streaming endpoint (/agent/turn-stream) can reuse them verbatim.
 import { isPositiveConsentReply, isNegativeConsentReply, parseCallbackTime } from "@/lib/agent-consent";
-import { extractNameFromUtterance, findPatientByPhoneAndName } from "@/lib/patient-identification.server";
-import { fetchPatientCallHistoryContext, injectMemoryToSystemPrompt } from "@/lib/call-memory.server";
 
 // Internal endpoint called by the self-hosted bridge per patient utterance.
 // Auth: shared secret in `x-bridge-secret` header.
@@ -64,6 +62,32 @@ const InjectedReplySchema = z.object({
   // of normal turn processing. The bridge TTS speaks agent_reply as the hold
   // phrase, then the server validates and re-runs the agent automatically.
   validate_time: z.string().nullable().optional().default(null),
+  // Already-loaded clinic KB (rendered text) from turn-stream.ts's context
+  // load for this exact turn. When present, this route reuses it instead of
+  // calling loadClinicKnowledge again (which would re-derive the same data).
+  clinic_kb_rendered: z.string().nullable().optional(),
+  // Already-loaded patient/clinic rows + identifiers from turn-stream.ts's
+  // context load for this exact turn. When all three are present, this route
+  // seeds getCallContext from them instead of re-querying calls/patients/
+  // clinics/doctors/clinic_profile/kb_services/kb_faqs/kb_policies.
+  patient_snapshot: z
+    .object({
+      id: z.string(),
+      name: z.string(),
+      bp: z.string().nullable(),
+      blood_sugar: z.string().nullable(),
+      health_camp: z.string().nullable(),
+      age: z.number().nullable(),
+      gender: z.string().nullable(),
+      risk: z.string().nullable(),
+      phone: z.string(),
+    })
+    .nullable()
+    .optional(),
+  clinic_snapshot: z.object({ id: z.string(), name: z.string() }).nullable().optional(),
+  clinic_id: z.string().nullable().optional(),
+  patient_id: z.string().nullable().optional(),
+  campaign_id: z.string().nullable().optional(),
 });
 
 const InputSchema = z
@@ -757,10 +781,40 @@ export async function runInboundPostCallExtraction(args: {
   }
 }
 
-async function getCallContext(supabase: AdminClient, callId: string): Promise<CallContext> {
+async function getCallContext(
+  supabase: AdminClient,
+  callId: string,
+  seed?: {
+    call: { id: string; clinic_id: string; patient_id: string; campaign_id: string | null; direction: string };
+    patient: CallContext["patient"];
+    clinic: CallContext["clinic"];
+  },
+): Promise<CallContext> {
   const now = Date.now();
   const cached = callContextCache.get(callId);
   if (cached && cached.expiresAt > now) return cached;
+
+  // Fast path: turn-stream.ts already resolved call/patient/clinic for this
+  // exact turn and passed it through via injectedReply. Reuse it instead of
+  // re-querying calls/patients/clinics (and skip doctors/clinic_profile/
+  // kb_services/kb_faqs/kb_policies entirely — those 5 tables are only
+  // consumed by the screening_to_opd/outbound branch, never on this path).
+  if (seed) {
+    const ctx: CallContext = {
+      call: seed.call,
+      patient: seed.patient,
+      clinic: seed.clinic,
+      doctors: [],
+      clinicProfile: null,
+      services: [],
+      faqs: [],
+      policies: [],
+      expiresAt: now + CTX_TTL_MS,
+    };
+    callContextCache.set(callId, ctx);
+    return ctx;
+  }
+
   const callRes = await supabase
     .from("calls")
     .select("id,clinic_id,patient_id,campaign_id,direction")
@@ -835,11 +889,34 @@ export const Route = createFileRoute("/api/public/agent/turn")({
             return jsonError(e instanceof Error ? e.message : String(e), "build_admin");
           }
 
+          // If turn-stream.ts already resolved patient/clinic for this exact
+          // turn and passed them through via injectedReply, seed getCallContext
+          // with them so a cache MISS doesn't re-query calls/patients/clinics
+          // (this is the persistence leg of a turn whose context was already
+          // loaded seconds earlier in the same logical turn).
+          const ctxSeed =
+            injectedReply?.patient_snapshot &&
+            injectedReply?.clinic_snapshot &&
+            injectedReply?.clinic_id &&
+            injectedReply?.patient_id
+              ? {
+                  call: {
+                    id: callId,
+                    clinic_id: injectedReply.clinic_id,
+                    patient_id: injectedReply.patient_id,
+                    campaign_id: injectedReply.campaign_id ?? null,
+                    direction: "inbound",
+                  },
+                  patient: injectedReply.patient_snapshot,
+                  clinic: injectedReply.clinic_snapshot,
+                }
+              : undefined;
+
           // Static KB context (cached for the lifetime of the call) +
           // dynamic per-turn call fields fetched in parallel.
           const tCtx = Date.now();
           const [ctxResult, dynRes] = await Promise.allSettled([
-            getCallContext(supabase, callId),
+            getCallContext(supabase, callId, ctxSeed),
             supabase
               .from("calls")
               .select(
@@ -882,48 +959,16 @@ export const Route = createFileRoute("/api/public/agent/turn")({
           // -----------------------------------------------------------------
           // Identity Unlock (Mid-Call Promotion)
           // -----------------------------------------------------------------
-          let effectiveMemory: string | null = null;
+          // NOTE: effectiveMemory (patient call-history timeline) is intentionally
+          // NOT fetched here. It was previously fetched on every turn via
+          // fetchPatientCallHistoryContext but never consumed anywhere in this
+          // file — the LLM system prompt that uses it is built exclusively in
+          // /api/public/agent/turn-stream.ts (injectMemoryToSystemPrompt), which
+          // already fetches and caches it. Fetching it again here duplicated that
+          // DB query on every single inbound/outbound turn for no used output.
           const isInbound = (call as { direction?: string }).direction === "inbound";
           const transcriptLen = transcript.length;
           const turnNumber = transcriptLen === 0 ? 1 : Math.floor(transcriptLen / 2) + 1;
-
-          if (isInbound) {
-            const { isPlaceholderName } = await import("@/lib/playbooks/inboundReception");
-            let identityUnlocked = !isPlaceholderName(patient.name);
-
-            // Try to unlock identity mid-call if still unknown and we have a patient utterance
-            if (!identityUnlocked && utterance && turnNumber > 1) {
-              const extractedName = await extractNameFromUtterance(utterance);
-              if (extractedName) {
-                const foundPatientId = await findPatientByPhoneAndName({
-                  phone: patient.phone || "",
-                  name: extractedName,
-                  clinicId: clinic.id,
-                });
-
-                if (foundPatientId && foundPatientId !== patient.id) {
-                  console.log(`[agent.turn] Patient promoted: ${patient.id} -> ${foundPatientId} (Name: ${extractedName})`);
-                  // Update call row in DB
-                  await supabase.from("calls").update({ patient_id: foundPatientId }).eq("id", callId);
-                  
-                  // Re-fetch patient details
-                  const newPatientRes = await supabase.from("patients").select("id,name,bp,blood_sugar,health_camp,age,gender,risk,phone").eq("id", foundPatientId).maybeSingle();
-                  if (newPatientRes.data) {
-                    patient = newPatientRes.data;
-                    identityUnlocked = true;
-                    // Invalidate cache
-                    callContextCache.delete(callId);
-                  }
-                }
-              }
-            }
-
-            if (identityUnlocked) {
-              effectiveMemory = await fetchPatientCallHistoryContext({ patientId: patient.id, supabase });
-            }
-          } else {
-            effectiveMemory = await fetchPatientCallHistoryContext({ patientId: patient.id, supabase });
-          }
 
           // -----------------------------------------------------------------
           // Playbook dispatch: non-screening use-cases (free_screening_invite,
@@ -955,15 +1000,31 @@ export const Route = createFileRoute("/api/public/agent/turn")({
           // Patients on outbound calls also ask about doctors / address /
           // fees / services mid-call — without ground truth the model
           // hallucinates. Cached per clinic for 30 min in agent-kb.server.
+          //
+          // EXCEPTION: for inbound_reception turns where the streaming
+          // endpoint (agent.turn-stream.ts) already loaded this same KB for
+          // this same turn and passed it through via injectedReply.clinic_kb_rendered,
+          // skip the reload entirely — this is the persistence-only leg of an
+          // already-completed turn, so doctors/profile/services/faqs/policies
+          // (not used on this path) and the rendered KB text (already in hand)
+          // would otherwise be re-fetched/re-derived for no reason.
           let inboundKb: Awaited<ReturnType<typeof loadClinicKnowledge>> | null = null;
-          try {
-            inboundKb = await loadClinicKnowledge(supabase, clinic.id);
-            playbookConfig = { ...playbookConfig, knowledge: inboundKb.rendered };
-            console.log(
-              `[agent.turn] KB loaded playbook=${playbookKey}: doctors=${inboundKb.doctors.length} services=${inboundKb.services.length} faqs=${inboundKb.faqs.length} policies=${inboundKb.policies.length} profile=${inboundKb.profile ? "Y" : "N"}`,
-            );
-          } catch (e) {
-            console.error(`[agent.turn] loadClinicKnowledge failed: ${e instanceof Error ? e.message : e}`);
+          const reuseInjectedKb =
+            isInbound && playbookKey === "inbound_reception" && !!injectedReply &&
+            injectedReply.clinic_kb_rendered !== undefined && injectedReply.clinic_kb_rendered !== null;
+          if (reuseInjectedKb) {
+            playbookConfig = { ...playbookConfig, knowledge: injectedReply.clinic_kb_rendered };
+            console.log(`[agent.turn] KB reused from injectedReply (skip loadClinicKnowledge) playbook=${playbookKey}`);
+          } else {
+            try {
+              inboundKb = await loadClinicKnowledge(supabase, clinic.id);
+              playbookConfig = { ...playbookConfig, knowledge: inboundKb.rendered };
+              console.log(
+                `[agent.turn] KB loaded playbook=${playbookKey}: doctors=${inboundKb.doctors.length} services=${inboundKb.services.length} faqs=${inboundKb.faqs.length} policies=${inboundKb.policies.length} profile=${inboundKb.profile ? "Y" : "N"}`,
+              );
+            } catch (e) {
+              console.error(`[agent.turn] loadClinicKnowledge failed: ${e instanceof Error ? e.message : e}`);
+            }
           }
           if (playbookKey === "newborn_vaccination") {
             const babyRes = await supabase
@@ -1043,7 +1104,7 @@ export const Route = createFileRoute("/api/public/agent/turn")({
             // Re-running was the cause of audio/transcript divergence: the
             // bridge would TTS the streamed reply while this branch wrote
             // a different (re-LLM'd) reply into transcript.
-            if (injectedReply) {
+            if (injectedReply && !injectedReply.validate_time) {
               console.log(
                 `[agent.turn] playbook=${playbookKey} using injectedReply (skip LLM) intent=${injectedReply.intent}`,
               );
@@ -1364,6 +1425,18 @@ export const Route = createFileRoute("/api/public/agent/turn")({
             }
 
             let pbOut;
+            if (injectedReply && injectedReply.validate_time) {
+              // turn-stream.ts already streamed injectedReply.agent_reply
+              // (the hold phrase) to the bridge as TTS chunks before this
+              // request was made. Seed pbOut from it so the existing
+              // VALIDATE_TIME LOOP below runs unchanged — same as it already
+              // does on the non-streaming fallback path — instead of
+              // re-running the LLM for a reply the caller already heard.
+              console.log(
+                `[agent.turn] playbook=${playbookKey} using injectedReply.validate_time (skip LLM, enter validate_time loop) callId=${callId}`,
+              );
+              pbOut = injectedReply as never;
+            } else {
             try {
               pbOut = await runPlaybookTurn({
                 playbook,
@@ -1383,6 +1456,7 @@ export const Route = createFileRoute("/api/public/agent/turn")({
                 callback_requested: false,
                 callback_time: null,
               } as never;
+            }
             }
 
             // ---------------------------------------------------------------

@@ -13,7 +13,6 @@ import { isPositiveConsentReply, isNegativeConsentReply, parseCallbackTime } fro
 import { FOLLOWUP_BP_GLUCOSE, CALLBACK_ASK_TIME } from "@/lib/agent-canonical";
 import { AgentReplyExtractor, parseSseLine } from "@/lib/agent-stream.server";
 import { fetchPatientCallHistoryContext, injectMemoryToSystemPrompt } from "@/lib/call-memory.server";
-import { extractNameFromUtterance, findPatientByPhoneAndName } from "@/lib/patient-identification.server";
 import {
   loadClinicKnowledge,
   sanitizeAgentReply,
@@ -117,6 +116,9 @@ function toAgentResult(
   }
   if (typeof out.resolved === "boolean") {
     extras.resolved = out.resolved;
+  }
+  if (typeof out.validate_time === "string" || out.validate_time === null) {
+    extras.validate_time = out.validate_time ?? null;
   }
   return result;
 }
@@ -227,44 +229,22 @@ export const Route = createFileRoute("/api/public/agent/turn-stream")({
             playbookConfig = { ...playbookConfig, knowledge: kb.rendered };
           }
           if (isInbound) {
-            let identityUnlocked = !isPlaceholderName(patient.name);
+            const identityUnlocked = !isPlaceholderName(patient.name);
             const pastFirstTurn = turnNumber > 1;
 
-            // Try to unlock identity mid-call if still unknown and we have a patient utterance
-            if (!identityUnlocked && utterance && turnNumber > 1) {
-              const extractedName = await extractNameFromUtterance(utterance);
-              if (extractedName) {
-                const foundPatientId = await findPatientByPhoneAndName({
-                  phone: patient.phone || "",
-                  name: extractedName,
-                  clinicId: clinic.id,
-                });
-
-                if (foundPatientId && foundPatientId !== patient.id) {
-                  console.log(`[agent.turn-stream] Patient promoted: ${patient.id} -> ${foundPatientId} (Name: ${extractedName})`);
-                  // Update call row in DB
-                  await supabase.from("calls").update({ patient_id: foundPatientId }).eq("id", callId);
-                  
-                  // Re-fetch patient details
-                  const newPatientRes = await supabase.from("patients").select("id,name,bp,blood_sugar,health_camp,age,gender,risk,phone").eq("id", foundPatientId).maybeSingle();
-                  if (newPatientRes.data) {
-                    patient = newPatientRes.data;
-                    identityUnlocked = true;
-                    // Invalidate cache since patient identity changed
-                    streamCtxCache.delete(callId);
-                  }
-                }
-              }
-            }
-
-            if (identityUnlocked && (pastFirstTurn || identityUnlocked)) {
-              if (!callMetadata.is_memory_injected) {
-                console.log(`[agent.turn-stream] Inbound Identity Unlocked ("${patient.name}"). Fetching timeline historical memories...`);
-                effectiveMemory = await fetchPatientCallHistoryContext({ patientId: patient.id, supabase });
-                await supabase.from("calls").update({ metadata: { ...callMetadata, is_memory_injected: true, injected_timeline_len: effectiveMemory?.length ?? 0 } }).eq("id", callId);
-              } else {
-                effectiveMemory = await fetchPatientCallHistoryContext({ patientId: patient.id, supabase });
-              }
+            // Fetch patient call-history context ONCE per call: only when it
+            // has never been injected before. is_memory_injected gates the
+            // fetch itself now (not just the one-time DB write) — on a later
+            // cache-miss turn (TTL expiry, cold isolate) where injection
+            // already happened earlier in this same call, we do NOT
+            // re-query fetchPatientCallHistoryContext again. The earlier
+            // turn's system prompt already received the memory; redundantly
+            // re-fetching identical history on every subsequent cache-miss
+            // turn added latency for no behavioral benefit.
+            if (identityUnlocked && pastFirstTurn && !callMetadata.is_memory_injected) {
+              console.log(`[agent.turn-stream] Inbound Identity Unlocked ("${patient.name}"). Fetching timeline historical memories...`);
+              effectiveMemory = await fetchPatientCallHistoryContext({ patientId: call.patient_id, supabase });
+              await supabase.from("calls").update({ metadata: { ...callMetadata, is_memory_injected: true, injected_timeline_len: effectiveMemory?.length ?? 0 } }).eq("id", callId);
             }
           } else {
             if (!effectiveMemory) {
@@ -279,8 +259,13 @@ export const Route = createFileRoute("/api/public/agent/turn-stream")({
           }
         }
         
-        // If memory was unlocked on THIS turn, invalidate cache so we re-fetch next turn if needed
-        if (isInbound && turnNumber > 1 && !isPlaceholderName(patient.name) && !effectiveMemory) {
+        // If memory has not yet been successfully injected for this call,
+        // invalidate the cache so the next turn retries the fetch above.
+        // Once is_memory_injected is true, do NOT keep evicting on every
+        // cache-miss turn — that previously caused the patient-history
+        // fetch (and the patient/clinic/KB queries in the cache-miss
+        // branch) to redundantly re-run on every remaining turn of the call.
+        if (isInbound && turnNumber > 1 && !isPlaceholderName(patient.name) && !effectiveMemory && !callMetadata.is_memory_injected) {
            streamCtxCache.delete(callId);
         }
 
@@ -295,6 +280,7 @@ export const Route = createFileRoute("/api/public/agent/turn-stream")({
         const currentIntent = outcomeCallType ?? rowIntent ?? "Unidentified";
 
         const playbookKey = (useCase ?? (isInbound ? "inbound_reception" : "screening_to_opd")) as PlaybookKey;
+        const playbook = resolvePlaybook(playbookKey);
 
         const pbCtx: PlaybookContext = {
           callId,
@@ -491,6 +477,25 @@ export const Route = createFileRoute("/api/public/agent/turn-stream")({
 
               const doctorKeyToId = kb ? buildDoctorKeyToId(kb.doctors) : undefined;
               const result = toAgentResult(parsedOut, doctorKeyToId);
+              // Pass the already-loaded clinic KB (rendered text) through to the
+              // persistence call (/agent/turn with injectedReply) so it does not
+              // re-run loadClinicKnowledge for data we already have in hand for
+              // this exact turn. Scoped to inbound_reception only — out of scope
+              // playbooks (screening/vaccination) are unaffected.
+              if (playbookKey === "inbound_reception") {
+                const extras = result as unknown as Record<string, unknown>;
+                extras.clinic_kb_rendered = kb?.rendered ?? null;
+                // Pass the already-loaded patient/clinic rows + identifiers
+                // through too, so getCallContext on the persistence call can
+                // skip its calls/patients/clinics queries entirely on a cache
+                // miss (e.g. cold isolate) instead of re-deriving data this
+                // request already resolved moments earlier for this turn.
+                extras.patient_snapshot = patient ?? null;
+                extras.clinic_snapshot = clinic ?? null;
+                extras.clinic_id = call.clinic_id ?? null;
+                extras.patient_id = call.patient_id ?? null;
+                extras.campaign_id = call.campaign_id ?? null;
+              }
               emit({ type: "final", result });
             } catch (e) {
               const msg = e instanceof Error ? e.message : String(e);

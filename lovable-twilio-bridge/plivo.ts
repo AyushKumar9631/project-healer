@@ -65,7 +65,7 @@ const ELEVENLABS_STT_LANGUAGE = process.env.ELEVENLABS_STT_LANGUAGE ?? "hin";
 // increase mid-sentence cuts.
 const SCRIBE_VAD_SILENCE_SECS = (() => {
   const raw = process.env.STT_SILENCE_SECS;
-  if (!raw) return 0.4;
+  if (!raw) return 0.3;
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0.2 || n > 3) return 0.4;
   return n;
@@ -620,7 +620,30 @@ export function attachPlivo(
               }
               await ttsQueue;
               if (finalResult) {
-                void persistInjectedReply(callId!, cleaned, false, finalResult);
+                if (finalResult.validate_time) {
+                  // Hold-phrase agent_reply has already been spoken above via
+                  // the chunk frames. Now await persistence — this is the
+                  // same /agent/turn call as the line below, just awaited
+                  // instead of fire-and-forget, because /agent/turn's
+                  // existing (unchanged) validate_time loop runs server-side
+                  // and its response carries the post-validation reply that
+                  // must be spoken next so the caller never hears dead air.
+                  const validated = await persistInjectedReply(callId!, cleaned, false, finalResult);
+                  if (validated?.agent_reply) {
+                    await streamElevenLabsTtsToPlivo(plivoWs, streamId, validated.agent_reply, {
+                      onFrame: () => {
+                        framesSent++;
+                      },
+                      register: (ctl) => {
+                        bargeInController = ctl;
+                      },
+                    });
+                    lastAgentText = validated.agent_reply;
+                    endCallFlag = !!validated.end_call;
+                  }
+                } else {
+                  void persistInjectedReply(callId!, cleaned, false, finalResult);
+                }
                 timing.record(
                   "reply_tts_done",
                   { reply_len: finalResult.agent_reply.length, frames: framesSent, streamed: true },
@@ -1553,6 +1576,36 @@ type AgentTurnResult = {
   callback_time: string | null;
   agent_reply: string;
   end_call: boolean;
+  // Already-loaded clinic KB (rendered text) from turn-stream's context load.
+  // Forwarded as-is to /agent/turn via injectedReply so it can reuse it
+  // instead of re-running loadClinicKnowledge for this same turn.
+  clinic_kb_rendered?: string | null;
+  // Already-loaded patient/clinic rows + identifiers from turn-stream's
+  // context load. Forwarded as-is to /agent/turn via injectedReply so
+  // getCallContext can seed itself instead of re-querying calls/patients/
+  // clinics for this same turn.
+  patient_snapshot?: {
+    id: string;
+    name: string;
+    bp: string | null;
+    blood_sugar: string | null;
+    health_camp: string | null;
+    age: number | null;
+    gender: string | null;
+    risk: string | null;
+    phone: string;
+  } | null;
+  clinic_snapshot?: { id: string; name: string } | null;
+  clinic_id?: string | null;
+  patient_id?: string | null;
+  campaign_id?: string | null;
+  // validate_time: non-null means the LLM requested server-side slot
+  // validation (inbound_reception only). agent_reply on this frame is the
+  // hold phrase, already streamed/spoken via the chunk frames above. The
+  // bridge must await persistInjectedReply (which runs /agent/turn's
+  // existing validate_time loop) and speak ITS returned agent_reply next,
+  // instead of firing persistence and moving on immediately.
+  validate_time?: string | null;
 };
 type StreamFrame =
   | { type: "chunk"; text: string }
@@ -1609,12 +1662,14 @@ async function* fetchAgentReplyStreaming(
 // Persist the streamed reply by calling the legacy turn endpoint with
 // `injectedReply`. This runs all fast-paths + transcript writes + mirroring
 // without re-invoking the LLM. Best-effort; never throws into the call path.
+// Returns the parsed response body (contains the post-validation agent_reply
+// when injectedReply.validate_time was set) or null on failure.
 async function persistInjectedReply(
   callId: string,
   utterance: string,
   isFirstTurn: boolean,
   result: AgentTurnResult,
-): Promise<void> {
+): Promise<{ agent_reply: string; end_call: boolean } | null> {
   try {
     const url = `${process.env.LOVABLE_BASE_URL}/api/public/agent/turn`;
     const res = await fetch(url, {
@@ -1627,9 +1682,12 @@ async function persistInjectedReply(
     });
     if (!res.ok) {
       console.error(`[plivo/agent.persist] ${url} → ${res.status}`);
+      return null;
     }
+    return (await res.json()) as { agent_reply: string; end_call: boolean };
   } catch (e) {
     console.error(`[plivo/agent.persist] failed: ${e instanceof Error ? e.message : e}`);
+    return null;
   }
 }
 
